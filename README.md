@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🧠 LLMMEMORY
+# 🧠 MEMORYLLM
 
 ### Differentiable Neural Computer Augmented Language Model
 
