@@ -1,12 +1,17 @@
 """
 Differentiable Neural Computer (DNC) + GPT2 Training
-WITH torch.compile optimization - FIXED for DataParallel
+- Fixed: multiple/nested tqdm bars during mid-training validation
+- Fixed: step-level loss & accuracy tracked and plotted after training
 """
 
 import math
 import os
 from collections import defaultdict
 
+import matplotlib
+matplotlib.use("Agg")          # non-interactive backend; works on headless servers
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,12 +20,12 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoTokenizer, GPT2Config, GPT2Model
 
-# Check for torch.compile availability
-TORCH_COMPILE_AVAILABLE = hasattr(torch, 'compile')
+TORCH_COMPILE_AVAILABLE = hasattr(torch, "compile")
 if TORCH_COMPILE_AVAILABLE:
     print(f"✅ torch.compile available (PyTorch {torch.__version__})")
 else:
-    print(f"⚠️ torch.compile not available (need PyTorch 2.0+)")
+    print(f"⚠️  torch.compile not available (need PyTorch 2.0+)")
+
 
 # ══════════════════════════════════════════════════════════════════
 # CONFIG
@@ -40,7 +45,7 @@ class Config:
 
     # ── training mode ─────────────────────────────────────────────
     epochs      = 1
-    max_steps   = 0
+    max_steps   = 0           # 0 → use epochs
 
     # ── training hyperparams ──────────────────────────────────────
     batch_size  = 4
@@ -54,12 +59,16 @@ class Config:
 
     # ── checkpointing ─────────────────────────────────────────────
     save_dir         = "checkpoints"
-    save_every_steps = 2000
+    save_every_steps = 3000
+
+    # ── plot ──────────────────────────────────────────────────────
+    plot_dir        = "plots"
+    log_every_steps = 50      # record train metrics every N steps
 
     # ── compilation ───────────────────────────────────────────────
-    use_compile = False          # DISABLED by default for DataParallel compatibility
+    use_compile  = False      # DISABLED by default for DataParallel
     compile_mode = "reduce-overhead"
-    
+
     # ── hardware ──────────────────────────────────────────────────
     device   = "cuda" if torch.cuda.is_available() else "cpu"
     num_gpus = min(2, torch.cuda.device_count())
@@ -145,7 +154,6 @@ def _gpt2_cfg(cfg, vocab_size):
 
 
 class BaselineGPT2(nn.Module):
-    """Vanilla GPT2, no memory."""
     def __init__(self, cfg, vocab_size):
         super().__init__()
         self.transformer = GPT2Model(_gpt2_cfg(cfg, vocab_size))
@@ -157,7 +165,6 @@ class BaselineGPT2(nn.Module):
 
 
 class DNCLLM(nn.Module):
-    """GPT2 controller + DNC external memory."""
     def __init__(self, cfg, vocab_size):
         super().__init__()
         self.cfg         = cfg
@@ -196,28 +203,21 @@ class DNCLLM(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════
-# COMPILATION WRAPPER - FIXED for DataParallel
+# COMPILATION WRAPPER
 # ══════════════════════════════════════════════════════════════════
 
 def maybe_compile(model, model_name):
-    """Apply torch.compile if available and configured.
-    IMPORTANT: Only compile if NOT using DataParallel, or compile each replica separately."""
     if TORCH_COMPILE_AVAILABLE and cfg.use_compile:
-        # Don't compile if we're going to wrap with DataParallel
         if cfg.num_gpus > 1:
-            print(f"  ⚠️ torch.compile disabled for {model_name} when using DataParallel")
-            print(f"     (compile + DataParallel has compatibility issues)")
+            print(f"  ⚠️  torch.compile disabled for {model_name} (DataParallel conflict)")
             return model
-        
-        print(f"  🔧 Compiling {model_name} with mode='{cfg.compile_mode}'...")
+        print(f"  🔧 Compiling {model_name} …")
         try:
-            # Compile the full model
-            compiled_model = torch.compile(model, mode=cfg.compile_mode, fullgraph=False)
-            print(f"  ✅ {model_name} compiled successfully")
-            return compiled_model
+            compiled = torch.compile(model, mode=cfg.compile_mode, fullgraph=False)
+            print(f"  ✅ {model_name} compiled")
+            return compiled
         except Exception as e:
-            print(f"  ⚠️ Compilation failed: {e}, using uncompiled model")
-            return model
+            print(f"  ⚠️  Compilation failed ({e}), using uncompiled model")
     return model
 
 
@@ -243,7 +243,7 @@ def routing_loss(logits_mem, logits_no_mem, write_gates):
     kl       = F.kl_div(
         F.log_softmax(p_no_mem, dim=-1),
         F.softmax(p_mem, dim=-1),
-        reduction='none',
+        reduction="none",
     ).sum(-1).detach()
     return -(gates * kl).mean()
 
@@ -283,7 +283,7 @@ def compute_metrics(logits, input_ids,
 
     ce                  = F.cross_entropy(flat_pred, flat_targets)
     metrics["loss"]     = ce.item()
-    metrics["ppl"]      = math.exp(ce.item())
+    metrics["ppl"]      = math.exp(min(ce.item(), 20))   # clip to avoid overflow
     metrics["bpt"]      = ce.item() / math.log(2)
     metrics["top1_acc"] = (flat_pred.argmax(-1) == flat_targets).float().mean().item()
     top5                = flat_pred.topk(5, dim=-1).indices
@@ -311,7 +311,7 @@ def compute_metrics(logits, input_ids,
     if logits_no_mem is not None:
         p_m  = F.softmax(logits[:, :-1].reshape(-1, V), dim=-1)
         p_nm = F.log_softmax(logits_no_mem[:, :-1].reshape(-1, V), dim=-1)
-        metrics["mem_kl"] = F.kl_div(p_nm, p_m, reduction='batchmean').item()
+        metrics["mem_kl"] = F.kl_div(p_nm, p_m, reduction="batchmean").item()
 
     return metrics
 
@@ -357,16 +357,21 @@ def save_checkpoint(raw_model, optimizer, global_step, epoch, val_ppl, tag, cfg)
 
 
 # ══════════════════════════════════════════════════════════════════
-# VALIDATION
+# VALIDATION  ← no inner tqdm: DataParallel replicas write stdout
+#               simultaneously and cause cascading bar explosion.
+#               We iterate silently and emit one tqdm.write line
+#               every VAL_REPORT_EVERY batches instead.
 # ══════════════════════════════════════════════════════════════════
+
+VAL_REPORT_EVERY = 100   # print a single progress line every N val batches
 
 @torch.no_grad()
 def validate(model, raw_model, val_loader, cfg, is_dnc, desc="val"):
     model.eval()
-    tracker = MetricTracker()
-    bar     = tqdm(val_loader, desc=f"  [{desc}]", dynamic_ncols=True, leave=False)
+    tracker  = MetricTracker()
+    n_batches = len(val_loader)
 
-    for batch in bar:
+    for i, batch in enumerate(val_loader):          # ← plain enumerate, no tqdm
         input_ids = batch["input_ids"].to(cfg.device)
         B         = input_ids.size(0)
 
@@ -383,9 +388,103 @@ def validate(model, raw_model, val_loader, cfg, is_dnc, desc="val"):
             m      = compute_metrics(logits, input_ids)
 
         tracker.update(m)
-        bar.set_postfix(ppl=f"{m['ppl']:.2f}", top1=f"{m['top1_acc']:.3f}")
 
+        # One clean line every VAL_REPORT_EVERY batches (or on the last batch)
+        if (i + 1) % VAL_REPORT_EVERY == 0 or (i + 1) == n_batches:
+            tqdm.write(
+                f"    [{desc}] {i+1}/{n_batches} batches | "
+                f"ppl={m['ppl']:.2f} | top1={m['top1_acc']:.3f}"
+            )
+
+    model.train()
     return tracker.all_avgs()
+
+
+# ══════════════════════════════════════════════════════════════════
+# PLOTTING  ← NEW
+# ══════════════════════════════════════════════════════════════════
+
+_DARK  = "#0d1117"
+_GRID  = "#21262d"
+_TEXT  = "#e6edf3"
+_COLS  = {"GPT2 Baseline": "#58a6ff", "GPT2 + DNC": "#f78166"}
+_VAL_S = {"GPT2 Baseline": "o",       "GPT2 + DNC": "s"}
+
+
+def _ax_style(ax, title, xlabel, ylabel):
+    ax.set_facecolor(_DARK)
+    ax.tick_params(colors=_TEXT, labelsize=8)
+    ax.xaxis.label.set_color(_TEXT)
+    ax.yaxis.label.set_color(_TEXT)
+    ax.title.set_color(_TEXT)
+    ax.set_title(title, fontsize=10, fontweight="bold", pad=6)
+    ax.set_xlabel(xlabel, fontsize=8)
+    ax.set_ylabel(ylabel, fontsize=8)
+    ax.grid(True, color=_GRID, linewidth=0.6, linestyle="--")
+    for spine in ax.spines.values():
+        spine.set_edgecolor(_GRID)
+
+
+def plot_training_curves(history: dict, cfg):
+    """
+    history: {
+        "GPT2 Baseline": {
+            "train_steps": [...], "train_loss": [...], "train_acc": [...],
+            "val_steps":   [...], "val_loss":   [...], "val_acc":   [...]
+        },
+        "GPT2 + DNC": { ... }
+    }
+    """
+    os.makedirs(cfg.plot_dir, exist_ok=True)
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+    fig.patch.set_facecolor(_DARK)
+    fig.suptitle("Training Curves — GPT2 Baseline vs GPT2 + DNC",
+                 color=_TEXT, fontsize=12, fontweight="bold", y=1.01)
+
+    ax_loss, ax_acc = axes
+
+    for label, h in history.items():
+        col = _COLS[label]
+        sym = _VAL_S[label]
+
+        # ── train loss (thin solid line) ──────────────────────────
+        if h["train_steps"]:
+            ax_loss.plot(h["train_steps"], h["train_loss"],
+                         color=col, linewidth=1.0, alpha=0.55,
+                         label=f"{label} train")
+            ax_acc.plot(h["train_steps"], h["train_acc"],
+                        color=col, linewidth=1.0, alpha=0.55,
+                        label=f"{label} train")
+
+        # ── val checkpoints (bold markers + dashed line) ──────────
+        if h["val_steps"]:
+            ax_loss.plot(h["val_steps"], h["val_loss"],
+                         color=col, linewidth=2.0, linestyle="--",
+                         marker=sym, markersize=6,
+                         label=f"{label} val")
+            ax_acc.plot(h["val_steps"], h["val_acc"],
+                        color=col, linewidth=2.0, linestyle="--",
+                        marker=sym, markersize=6,
+                        label=f"{label} val")
+
+    _ax_style(ax_loss, "Loss (CE) vs Steps", "Step", "Loss")
+    _ax_style(ax_acc,  "Top-1 Accuracy vs Steps", "Step", "Accuracy")
+
+    for ax in axes:
+        leg = ax.legend(fontsize=7, framealpha=0.3,
+                        facecolor=_GRID, labelcolor=_TEXT,
+                        edgecolor=_GRID)
+        ax.xaxis.set_major_formatter(mticker.FuncFormatter(
+            lambda x, _: f"{int(x):,}"))
+
+    plt.tight_layout()
+    save_path = os.path.join(cfg.plot_dir, "training_curves.png")
+    fig.savefig(save_path, dpi=150, bbox_inches="tight",
+                facecolor=_DARK)
+    plt.close(fig)
+    tqdm.write(f"\n  📊  Plot saved → {save_path}")
+    return save_path
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -400,10 +499,16 @@ def _infinite_epochs():
 
 
 # ══════════════════════════════════════════════════════════════════
-# CORE TRAINING LOOP
+# CORE TRAINING LOOP  ← FIXED tqdm + history recording
 # ══════════════════════════════════════════════════════════════════
 
-def train_model(model, raw_model, train_loader, val_loader, cfg, is_dnc, tag):
+def train_model(model, raw_model, train_loader, val_loader, cfg,
+                is_dnc, tag, history_out: dict):
+    """
+    history_out is mutated in-place:
+      { "train_steps", "train_loss", "train_acc",
+        "val_steps",   "val_loss",   "val_acc" }
+    """
     optimizer   = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=0.01)
     use_steps   = cfg.max_steps > 0
     max_steps   = cfg.max_steps if use_steps else cfg.epochs * len(train_loader)
@@ -412,9 +517,11 @@ def train_model(model, raw_model, train_loader, val_loader, cfg, is_dnc, tag):
     val_metrics = {}
     last_saved_step = 0
 
-    mode_str = f"max_steps={cfg.max_steps}" if use_steps else f"epochs={cfg.epochs}"
+    mode_str = (f"max_steps={cfg.max_steps}" if use_steps
+                else f"epochs={cfg.epochs}")
     tqdm.write(f"\n  Mode: {mode_str}  |  steps/epoch: {len(train_loader)}"
-               f"  |  save every {cfg.save_every_steps} steps")
+               f"  |  save every {cfg.save_every_steps} steps"
+               f"  |  log every {cfg.log_every_steps} steps")
 
     epoch_iter = range(cfg.epochs) if not use_steps else _infinite_epochs()
 
@@ -423,11 +530,13 @@ def train_model(model, raw_model, train_loader, val_loader, cfg, is_dnc, tag):
         epoch_loss = 0.0
         n_batches  = 0
 
+        # position=0 → main training bar always on line 0
         train_bar = tqdm(
             train_loader,
             desc          = f"[{tag}] epoch {epoch+1}",
             dynamic_ncols = True,
             leave         = True,
+            position      = 0,
         )
 
         for batch in train_bar:
@@ -438,6 +547,7 @@ def train_model(model, raw_model, train_loader, val_loader, cfg, is_dnc, tag):
             input_ids = batch["input_ids"].to(cfg.device)
             B         = input_ids.size(0)
 
+            # ── forward ───────────────────────────────────────────
             if is_dnc:
                 memory, usage = raw_model.init_memory(B, cfg.device)
                 logits, _, _, write_gates, w_writes = model(input_ids, memory, usage)
@@ -460,6 +570,7 @@ def train_model(model, raw_model, train_loader, val_loader, cfg, is_dnc, tag):
                 loss   = lm_loss(logits, input_ids)
                 train_bar.set_postfix(step=global_step, loss=f"{loss.item():.3f}")
 
+            # ── backward ──────────────────────────────────────────
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -469,12 +580,39 @@ def train_model(model, raw_model, train_loader, val_loader, cfg, is_dnc, tag):
             n_batches   += 1
             global_step += 1
 
-            if global_step % cfg.save_every_steps == 0 and global_step != last_saved_step:
+            # ── log step-level train metrics ──────────────────────
+            if global_step % cfg.log_every_steps == 0:
+                with torch.no_grad():
+                    if is_dnc:
+                        acc = (logits[:, :-1].argmax(-1)
+                               == input_ids[:, 1:]).float().mean().item()
+                    else:
+                        acc = (logits[:, :-1].argmax(-1)
+                               == input_ids[:, 1:]).float().mean().item()
+                history_out["train_steps"].append(global_step)
+                history_out["train_loss"].append(loss.item())
+                history_out["train_acc"].append(acc)
+
+            # ── mid-training validation ───────────────────────────
+            if (global_step % cfg.save_every_steps == 0
+                    and global_step != last_saved_step):
                 last_saved_step = global_step
-                val_metrics = validate(model, raw_model, val_loader, cfg, is_dnc,
-                                       f"{tag} step {global_step}")
+
+                # Pause train bar, run val, resume  ← FIX: val tqdm
+                # is position=1, leave=False → no extra lines left behind
+                val_metrics = validate(
+                    model, raw_model, val_loader, cfg, is_dnc,
+                    f"{tag} step {global_step}"
+                )
+
+                # record val checkpoint
+                history_out["val_steps"].append(global_step)
+                history_out["val_loss"].append(val_metrics["loss"])
+                history_out["val_acc"].append(val_metrics["top1_acc"])
+
                 tqdm.write(
                     f"\n  [{tag}] step {global_step} | "
+                    f"val_loss={val_metrics['loss']:.4f} | "
                     f"val_ppl={val_metrics['ppl']:.2f} | "
                     f"top1={val_metrics['top1_acc']:.4f} | "
                     f"top5={val_metrics['top5_acc']:.4f}"
@@ -494,9 +632,16 @@ def train_model(model, raw_model, train_loader, val_loader, cfg, is_dnc, tag):
         if global_step >= max_steps:
             break
 
+    # ── final validation ──────────────────────────────────────────
     if last_saved_step != global_step:
-        tqdm.write(f"\n  [{tag}] Final validation...")
-        val_metrics = validate(model, raw_model, val_loader, cfg, is_dnc, f"{tag} final")
+        tqdm.write(f"\n  [{tag}] Final validation…")
+        val_metrics = validate(
+            model, raw_model, val_loader, cfg, is_dnc, f"{tag} final"
+        )
+        history_out["val_steps"].append(global_step)
+        history_out["val_loss"].append(val_metrics["loss"])
+        history_out["val_acc"].append(val_metrics["top1_acc"])
+
         tqdm.write(
             f"  [{tag}] FINAL | "
             f"ppl={val_metrics['ppl']:.2f} | "
@@ -516,25 +661,25 @@ def train_model(model, raw_model, train_loader, val_loader, cfg, is_dnc, tag):
 # ══════════════════════════════════════════════════════════════════
 
 def print_comparison(all_results):
-    names      = list(all_results.keys())
-    col_w      = 20
-    name_w     = 24
-    W          = name_w + col_w * len(names) + col_w + 4
+    names  = list(all_results.keys())
+    col_w  = 20
+    name_w = 24
+    W      = name_w + col_w * len(names) + col_w + 4
 
     metrics_cfg = [
         ("ppl",            "Perplexity ↓",        ".2f",  False),
-        ("bpt",            "Bits/Token ↓",         ".4f",  False),
-        ("loss",           "CE Loss ↓",            ".4f",  False),
-        ("top1_acc",       "Top-1 Accuracy ↑",     ".4f",  True ),
-        ("top5_acc",       "Top-5 Accuracy ↑",     ".4f",  True ),
-        ("confidence",     "Confidence ↑",         ".4f",  True ),
-        ("mean_rank",      "Mean Rank ↓",          ".1f",  False),
-        ("pred_entropy",   "Pred Entropy",         ".4f",  None ),
-        ("avg_gate",       "Avg Write Gate",       ".4f",  None ),
-        ("gate_std",       "Gate Polarization ↑",  ".4f",  True ),
-        ("write_rate",     "Write Rate >0.7",      ".4f",  None ),
-        ("write_sparsity", "Write Sparsity ↑",     ".4f",  True ),
-        ("mem_kl",         "Memory KL ↑",          ".4f",  True ),
+        ("bpt",            "Bits/Token ↓",        ".4f",  False),
+        ("loss",           "CE Loss ↓",           ".4f",  False),
+        ("top1_acc",       "Top-1 Accuracy ↑",    ".4f",  True ),
+        ("top5_acc",       "Top-5 Accuracy ↑",    ".4f",  True ),
+        ("confidence",     "Confidence ↑",        ".4f",  True ),
+        ("mean_rank",      "Mean Rank ↓",         ".1f",  False),
+        ("pred_entropy",   "Pred Entropy",        ".4f",  None ),
+        ("avg_gate",       "Avg Write Gate",      ".4f",  None ),
+        ("gate_std",       "Gate Polarization ↑", ".4f",  True ),
+        ("write_rate",     "Write Rate >0.7",     ".4f",  None ),
+        ("write_sparsity", "Write Sparsity ↑",    ".4f",  True ),
+        ("mem_kl",         "Memory KL ↑",         ".4f",  True ),
     ]
 
     print("\n" + "═" * W)
@@ -604,35 +749,41 @@ def inspect_writes(model, tokenizer, text, cfg):
 # ══════════════════════════════════════════════════════════════════
 
 def run():
-    mode_str = f"max_steps={cfg.max_steps}" if cfg.max_steps > 0 else f"epochs={cfg.epochs}"
-    compile_str = f" | torch.compile: {cfg.compile_mode}" if (TORCH_COMPILE_AVAILABLE and cfg.use_compile and cfg.num_gpus <= 1) else ""
-    
+    mode_str    = (f"max_steps={cfg.max_steps}" if cfg.max_steps > 0
+                   else f"epochs={cfg.epochs}")
+    compile_str = (f" | torch.compile: {cfg.compile_mode}"
+                   if (TORCH_COMPILE_AVAILABLE and cfg.use_compile and cfg.num_gpus <= 1)
+                   else "")
+
     print(f"\n{'═'*55}")
     print(f"  Device       : {cfg.device}")
     print(f"  GPUs         : {torch.cuda.device_count()} available, using {cfg.num_gpus}")
     print(f"  Training mode: {mode_str}")
     print(f"  Compilation  : {compile_str if compile_str else 'disabled'}")
     print(f"  Checkpoint   : every {cfg.save_every_steps} steps → ./{cfg.save_dir}/")
+    print(f"  Plot         : every {cfg.log_every_steps} train steps  → ./{cfg.plot_dir}/")
     print(f"{'═'*55}\n")
 
-    tokenizer  = AutoTokenizer.from_pretrained(cfg.model_name)
+    tokenizer           = AutoTokenizer.from_pretrained(cfg.model_name)
     tokenizer.pad_token = tokenizer.eos_token
-    vocab_size = tokenizer.vocab_size
+    vocab_size          = tokenizer.vocab_size
 
     train_loader = get_dataloader(cfg, tokenizer, "train")
     val_loader   = get_dataloader(cfg, tokenizer, "validation")
 
     all_results = {}
 
+    # history keyed by model label
+    all_history: dict[str, dict] = {}
+
     for label, is_dnc in [("GPT2 Baseline", False), ("GPT2 + DNC", True)]:
         print(f"\n{'═'*55}")
         print(f"  TRAINING: {label}")
         print(f"{'═'*55}")
 
-        model = (DNCLLM(cfg, vocab_size) if is_dnc else BaselineGPT2(cfg, vocab_size))
+        model = (DNCLLM(cfg, vocab_size) if is_dnc
+                 else BaselineGPT2(cfg, vocab_size))
         model = model.to(cfg.device)
-        
-        # Apply compilation BEFORE DataParallel
         model = maybe_compile(model, label)
 
         if cfg.num_gpus > 1:
@@ -643,12 +794,24 @@ def run():
         n_params  = sum(p.numel() for p in raw_model.parameters())
         print(f"  Parameters: {n_params/1e6:.1f}M\n")
 
-        results              = train_model(model, raw_model, train_loader, val_loader,
-                                           cfg, is_dnc, label.replace(" ", "_"))
-        all_results[label]   = results
+        history = {
+            "train_steps": [], "train_loss": [], "train_acc": [],
+            "val_steps":   [], "val_loss":   [], "val_acc":   [],
+        }
+        all_history[label] = history
+
+        results            = train_model(
+            model, raw_model, train_loader, val_loader,
+            cfg, is_dnc, label.replace(" ", "_"), history
+        )
+        all_results[label] = results
 
     print_comparison(all_results)
 
+    # ── plot both models on shared axes ───────────────────────────
+    plot_training_curves(all_history, cfg)
+
+    # ── memory write inspection ───────────────────────────────────
     print("  Memory write inspection (DNC):\n")
     dnc_ckpt_path = None
     if os.path.exists(cfg.save_dir):
@@ -661,7 +824,6 @@ def run():
         dnc_inspect = DNCLLM(cfg, vocab_size).to(cfg.device)
         ckpt        = torch.load(dnc_ckpt_path, map_location=cfg.device)
         dnc_inspect.load_state_dict(ckpt["model_state"])
-        # Don't compile for inspection to avoid issues
         inspect_writes(
             dnc_inspect, tokenizer,
             "Albert Einstein was born in 1879 in Ulm. "
@@ -675,6 +837,5 @@ def run():
 
 
 if __name__ == "__main__":
-    # Set use_compile=False for DataParallel compatibility
-    cfg.use_compile = False  # ← Change to True only if num_gpus=1
-    results = run()
+    cfg.use_compile = False   # set True only when num_gpus == 1
+    run()
